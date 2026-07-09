@@ -17,7 +17,7 @@
 8. [Application Layers](#8-application-layers)
 9. [Interface & Output Contract](#9-interface--output-contract)
 10. [Cross-Cutting Concerns](#10-cross-cutting-concerns)
-11. [Technology Options](#11-technology-options)
+11. [Technology Decisions](#11-technology-decisions)
 12. [Deployment Topology](#12-deployment-topology)
 13. [Future Extensions](#13-future-extensions)
 
@@ -25,15 +25,15 @@
 
 ## 1. Executive Summary
 
-The system is a **preference-driven restaurant recommender** that:
+The system is a **preference-driven restaurant recommender** built as a full-stack web application. It:
 
-1. Ingests and normalizes a real Zomato-style dataset from Hugging Face.
-2. Accepts structured user preferences (location, budget, cuisine, rating, extras).
-3. **Deterministically filters** the dataset to a bounded candidate set.
-4. Uses an **LLM only on that candidate set** to rank, explain, and optionally summarize.
-5. Renders human-readable results with grounded restaurant facts plus AI narratives.
+1. Ingests and normalizes the Zomato restaurant dataset (~51k rows) from Hugging Face, persisting it as a local Parquet cache.
+2. Accepts structured user preferences (location, budget, cuisine, minimum rating) through a React frontend.
+3. **Deterministically filters** the cached dataset to a bounded candidate pool via the FastAPI backend.
+4. Uses a **Groq-hosted LLM (LLaMA-3) only on that candidate pool** to rank, explain, and optionally summarize results.
+5. Returns a structured JSON response consumed by the frontend to display ranked recommendation cards.
 
-The architecture deliberately separates **factual retrieval** (dataset + filters) from **subjective reasoning** (LLM), so recommendations stay traceable to real records and hallucination risk is reduced.
+The architecture deliberately separates **factual retrieval** (Parquet cache + deterministic filters) from **subjective reasoning** (LLM), keeping recommendations traceable to real dataset records and minimizing hallucination risk.
 
 ---
 
@@ -46,7 +46,7 @@ The architecture deliberately separates **factual retrieval** (dataset + filters
 | **Bounded LLM context** | Send only top-N candidates (e.g., 15–30) to control cost, latency, and token limits. |
 | **Structured in, structured out** | User input and LLM output should use schemas (JSON) where possible for validation. |
 | **Explainability by default** | Each result includes an AI-generated “why this fits” tied to stated preferences. |
-| **Progressive complexity** | MVP can be CLI or Streamlit; same core modules support a future web API. |
+| **Layered interfaces** | Core recommendation modules are UI-agnostic; the same pipeline powers the React frontend, the Streamlit app, and the CLI entry point. |
 
 ---
 
@@ -57,7 +57,7 @@ The architecture deliberately separates **factual retrieval** (dataset + filters
 ```mermaid
 flowchart TB
     subgraph Client["Presentation Layer"]
-        UI[User Interface<br/>CLI / Web / Streamlit]
+        UI["React Frontend (Vercel)<br/>Streamlit App / CLI"]
     end
 
     subgraph App["Application Layer"]
@@ -156,7 +156,7 @@ flowchart TB
 | Concern | Design |
 |---------|--------|
 | **Source** | `ManikaSaini/zomato-restaurant-recommendation` on Hugging Face |
-| **Load strategy** | Download via `datasets` library; persist as Parquet/CSV/SQLite for fast reload |
+| **Load strategy** | Download via `datasets` library; persist as a Parquet file for fast in-memory reload at startup |
 | **Normalization** | Trim strings; standardize city names; parse ratings as float; map cost to numeric + budget tier |
 | **Schema mapping** | Map raw columns → canonical `Restaurant` model (see §5) |
 | **Validation** | Drop or flag rows missing name, location, or rating; log counts |
@@ -171,14 +171,11 @@ flowchart TB
 
 | Operation | Description |
 |-----------|-------------|
-| `get_all()` | Return full normalized set (dev/small deployments) |
-| `filter(criteria)` | Apply structured query (location, cuisine, rating, budget) |
-| `get_by_ids(ids)` | Hydrate full records after LLM returns ranked IDs |
+| `get_all()` | Return the full normalized restaurant collection for use by the filter service |
+| `distinct_cities()` | Return a sorted list of distinct city names, used to populate the location dropdown |
+| `load()` / `ensure_loaded()` | Load the Parquet cache into memory on startup or on first access |
 
-**Implementation options:**
-
-- **In-memory (MVP):** Pandas DataFrame or list of dataclasses loaded at startup.
-- **Persistent (scale):** SQLite with indexes on `location`, `cuisine`, `rating`, `cost_for_two`.
+**Implementation:** In-memory store backed by the Parquet cache file. The `CandidateFilterService` retrieves the full collection via `get_all()` and applies all filtering in Python — the repository is a read-only data source, not a query engine.
 
 ---
 
@@ -230,22 +227,24 @@ flowchart TB
 
 | Concern | Approach |
 |---------|----------|
-| **Model** | Groq family model with low temperature for consistent ranking; choose a cost-effective Groq model for demos |
-| **Temperature** | Low (0.2–0.4) for consistent ranking |
-| **Output** | Request JSON mode / structured output when supported |
-| **Fallback** | If LLM fails: return filter-sorted top-N with template explanations |
+| **Provider** | Groq API (LLaMA-3 model family) |
+| **Temperature** | Low (0.2) for deterministic, consistent ranking |
+| **Output format** | Structured output enforced via system prompt instructions and post-response validation — not a provider JSON mode |
+| **Retry** | One automatic retry on transient failure before escalating to the fallback path |
+| **Fallback** | If LLM fails or returns unparseable output: deterministic top-N ranked by rating with template explanations |
 
 ---
 
 #### 4.2.7 LLM Response Parser & Merger
 
-**Purpose:** Parse LLM JSON; validate IDs exist in candidates; merge with full restaurant records.
+**Purpose:** Parses LLM JSON; validates IDs exist in candidates; merges with full restaurant records.
 
 **Validation rules:**
 
-- Reject unknown `restaurant_id` values.
-- Deduplicate ranks.
-- If fewer than requested, backfill from filter order with note “ranked by rating (LLM unavailable).”
+- Strip markdown code fences before attempting JSON parse.
+- Reject any `restaurant_id` not present in the candidate set — unknown IDs trigger a parse error.
+- Reject duplicate or out-of-bounds rank values.
+- If the full parse fails, the orchestrator activates the fallback path; there is no partial backfill.
 
 ---
 
@@ -256,14 +255,17 @@ flowchart TB
 ```python
 # Pseudocode contract
 def recommend(preferences: UserPreferences) -> RecommendationResponse:
-    prefs = validate(preferences)
-    candidates = filter_service.apply(prefs)
-    if not candidates:
-        return empty_response(suggestions=...)
-    prompt = prompt_builder.build(prefs, candidates)
-    llm_raw = llm_client.complete(prompt)
-    ranked = parser.parse_and_validate(llm_raw, candidates)
-    return formatter.to_display(ranked, summary=...)
+    filter_result = filter_service.apply(preferences)
+    if not filter_result.candidates:
+        return empty_response(suggestions=filter_result.suggestions)
+    try:
+        llm_raw = llm_client.complete(preferences, filter_result.candidates)
+        response = parser.parse_llm_response(llm_raw, filter_result.candidates)
+        fallback_used = False
+    except Exception:
+        response = fallback_ranking(filter_result.candidates)
+        fallback_used = True
+    return response.with_metadata(filter_result, fallback_used)
 ```
 
 ---
@@ -317,28 +319,29 @@ Each **RecommendationCard** includes:
 
 #### Recommendation (output item)
 
+The `Recommendation` object returned by the LLM contains only the fields needed to re-associate with the candidate pool — restaurant data fields are not duplicated.
+
 ```json
 {
-  "rank": 1,
   "restaurant_id": "abc123",
-  "name": "Trattoria Example",
-  "cuisine": "Italian, Pizza",
-  "rating": 4.5,
-  "estimated_cost": 1200,
+  "rank": 1,
   "explanation": "Matches your Italian preference and medium budget..."
 }
 ```
 
 #### RecommendationResponse
 
+All metadata fields are top-level — there is no nested `metadata` wrapper.
+
 ```json
 {
   "recommendations": [],
   "summary": "Optional overview of the shortlist.",
-  "metadata": {
-    "candidates_considered": 18,
-    "filters_applied": ["location", "rating", "cuisine", "budget"]
-  }
+  "filters_applied": ["location", "min_rating", "cuisine", "budget"],
+  "candidates_considered": 18,
+  "suggestions": [],
+  "fallback_used": false,
+  "model_version": null
 }
 ```
 
@@ -371,9 +374,10 @@ sequenceDiagram
     Note over DB: Startup / refresh
 
     OR->>FS: UserPreferences
-    FS->>DB: Query by criteria
-    DB-->>FS: Candidate list
-    FS-->>OR: Bounded candidates
+    FS->>DB: get_all()
+    DB-->>FS: Full restaurant collection
+    FS->>FS: Apply filters in-memory
+    FS-->>OR: Bounded candidates (capped at MAX_CANDIDATES)
     OR->>PB: Prefs + candidates
     PB->>LLM: Structured prompt
     LLM-->>OR: Ranked JSON + explanations
@@ -437,8 +441,8 @@ The integration layer sits between **filtered structured data** and the **LLM**,
 
 **Anti-hallucination measures:**
 
-- Include explicit candidate `id` in the prompt.
-- Post-parse: drop any recommendation whose `id` ∉ candidate set.
+- Include explicit `restaurant_id` for each candidate in the serialized prompt payload.
+- Post-parse: reject any recommendation whose `restaurant_id` is not in the candidate set.
 - Prefer JSON schema / function calling when the provider supports it.
 
 ### 7.3 Example Prompt Skeleton
@@ -454,7 +458,7 @@ Preferences:
 
 Candidates (do not invent others):
 [
-  { "id": "1", "name": "...", "cuisine": "...", "rating": 4.2, "cost_for_two": 400, "location": "Connaught Place, Delhi" },
+  { "restaurant_id": "abc1", "name": "...", "cuisine": "...", "rating": 4.2, "cost_for_two": 400, "location": "Connaught Place, Delhi" },
   ...
 ]
 
@@ -465,50 +469,56 @@ Return top 5 ranked recommendations with explanations.
 
 | Failure | Behavior |
 |---------|----------|
-| LLM timeout | Top-N by rating with static explanation template |
-| Invalid JSON | Retry once; then fallback |
-| Empty filter results | User message: broaden criteria (no LLM call) |
-| Partial parse | Keep valid items; backfill remainder |
+| LLM timeout or API error | Retry once; if retry fails, return top-N by rating with template explanations |
+| Invalid or unparseable JSON | Immediate fallback — no partial backfill |
+| Unknown `restaurant_id` in response | Parse error triggers full fallback path |
+| Empty filter results | Return empty response with actionable suggestions; no LLM call is made |
 
 ---
 
 ## 8. Application Layers
 
-### 8.1 Suggested Module Structure
+### 8.1 Module Structure
 
 ```
-zomato-recommender/
+zomato-ai/
 ├── app/
-│   ├── main.py                 # Entry (CLI / Streamlit / FastAPI)
-│   └── ui/                     # Presentation components
+│   ├── api.py                  # FastAPI routes, CORS configuration, repository lifecycle
+│   ├── main.py                 # CLI entry point
+│   └── streamlit_app.py        # Streamlit interface (secondary UI)
 ├── core/
-│   ├── models.py               # UserPreferences, Restaurant, Recommendation
-│   ├── orchestrator.py         # recommend() workflow
+│   ├── models.py               # Pydantic domain models: Restaurant, UserPreferences, Recommendation
+│   ├── orchestrator.py         # recommend() workflow coordinator
 │   ├── filter.py               # Candidate filter service
-│   └── formatter.py            # Output display mapping
+│   ├── validator.py            # Preference input validation
+│   └── formatter.py            # Output formatting
 ├── data/
-│   ├── loader.py               # Hugging Face ingest
-│   ├── preprocessor.py         # Clean + normalize
-│   └── repository.py           # Query interface
+│   ├── loader.py               # Hugging Face dataset download + Parquet cache builder
+│   ├── preprocessor.py         # Normalization: fields, budget tiers, city aliases
+│   ├── repository.py           # In-memory restaurant store
+│   └── cache/
+│       ├── restaurants.parquet # Pre-built data cache
+│       └── cache_metadata.json # Ingest stats and budget thresholds
 ├── llm/
-│   ├── client.py               # Provider adapter
-│   ├── prompts.py              # Templates + versioning
-│   └── parser.py               # JSON validation + merge
+│   ├── client.py               # Groq API client with retry logic
+│   ├── prompts.py              # Structured prompt builder
+│   └── parser.py               # LLM JSON response parser and fallback generator
 ├── config/
-│   └── settings.py             # Budget bands, MAX_CANDIDATES, API keys
-└── tests/
-    ├── test_filter.py
-    ├── test_parser.py
-    └── test_orchestrator.py
+│   └── settings.py             # Pydantic-settings: budget bands, MAX_CANDIDATES, API keys
+├── frontend/                   # React + Vite + Tailwind CSS (deployed on Vercel)
+│   └── src/
+│       └── components/         # Hero, PreferencesForm, Recommendations
+└── tests/                      # pytest unit and integration tests
 ```
 
-### 8.2 API Surface (if using FastAPI later)
+### 8.2 API Surface
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/api/v1/recommendations` | Body: `UserPreferences` → `RecommendationResponse` |
-| `GET` | `/api/v1/health` | Liveness |
-| `GET` | `/api/v1/metadata/locations` | Optional: distinct cities for autocomplete |
+| `POST` | `/api/recommend` | Body: `UserPreferences` → `RecommendationResponse` |
+| `GET` | `/api/cities` | Returns sorted distinct city names for the location dropdown |
+| `GET` | `/api/health` | Liveness check |
+| `GET` | `/docs` | Auto-generated interactive API documentation (Swagger UI) |
 
 ---
 
@@ -518,27 +528,30 @@ zomato-recommender/
 
 | Field | Control type | Required |
 |-------|--------------|----------|
-| Location | Dropdown or autocomplete | Yes |
-| Budget | Radio: low / medium / high | Yes |
-| Cuisine | Text or multi-select | No |
-| Minimum rating | Slider 1.0–5.0 | No |
-| Additional preferences | Textarea | No |
+| Location | Dropdown populated from `/api/cities` | Yes |
+| Budget | Radio buttons: Low / Medium / High | Yes |
+| Cuisine | Text input (comma-separated) | No |
+| Minimum rating | Slider 0.0–5.0 (step 0.1) | No |
 
 ### 9.2 Output Card Layout
 
+Each recommendation card displays rank, a computed match score, the restaurant identifier, and the AI-generated explanation.
+
 ```
 ┌─────────────────────────────────────────────┐
-│ #1  Restaurant Name                    ★ 4.5 │
-│     Italian · ₹800 for two                   │
-│     📍 Connaught Place, Delhi                │
+│  Rank  #1                      Match  95%   │
 │                                             │
-│     Why we picked this:                     │
-│     "Great fit for your medium budget and    │
-│      Italian cuisine preference..."         │
+│  Restaurant Name                            │
+│                                             │
+│  AI Reasoning                               │
+│  "Great fit for your medium budget and      │
+│   Italian cuisine preference..."            │
+│                                             │
+│  → AI Ranked  (revealed on hover)          │
 └─────────────────────────────────────────────┘
 ```
 
-Optional footer: **Summary** — one paragraph comparing the shortlist.
+An optional **Summary** paragraph (returned by the LLM) is displayed above the card grid. A **Fallback** badge is shown when the LLM path was not used and results are ranked by rating instead.
 
 ---
 
@@ -584,18 +597,19 @@ Optional footer: **Summary** — one paragraph comparing the shortlist.
 
 ---
 
-## 11. Technology Options
+## 11. Technology Decisions
 
-| Concern | Recommended (MVP) | Alternatives |
-|---------|---------------------|--------------|
-| Language | Python 3.11+ | — |
-| Dataset | `datasets` (Hugging Face) | Manual CSV download |
-| Data manipulation | Pandas | Polars |
-| UI | Streamlit | Gradio, React + FastAPI |
-| API (optional) | FastAPI | Flask |
-| LLM | Groq | Local Ollama for offline demos |
-| Config | `pydantic-settings` | python-dotenv |
-| Persistence | Parquet + in-memory | SQLite |
+| Concern | Implemented | Rationale |
+|---------|-------------|-----------|
+| Language | Python 3.11+ | Ecosystem fit for data processing, LLM integration, and FastAPI |
+| Dataset | Hugging Face `datasets` library | Direct access to `ManikaSaini/zomato-restaurant-recommendation` |
+| Data format | Parquet + in-memory (Pandas) | Fast columnar reads; cache built once at deploy time |
+| Backend framework | FastAPI | Native Pydantic support; auto-generated OpenAPI documentation |
+| Frontend | React + Vite + Tailwind CSS | Component model, fast builds, zero-config Vercel deployment |
+| LLM provider | Groq (LLaMA-3) | Low-latency inference; free tier suitable for portfolio use |
+| Configuration | `pydantic-settings` | Unified env var and `.env` management with type safety |
+| Frontend hosting | Vercel | Static bundle deployment; native Vite project support |
+| Backend hosting | Render | Managed Python web service with configurable build and start commands |
 
 ---
 
@@ -614,17 +628,21 @@ flowchart LR
 - Single process; dataset loaded on start.
 - Suitable for case study demos and interviews.
 
-### 12.2 Hosted (future)
+### 12.2 Production (Deployed)
 
 ```mermaid
 flowchart TB
-    USER[Browser] --> WEB[Web Frontend]
-    WEB --> API[FastAPI Service]
-    API --> DB[(SQLite / Postgres)]
-    API --> LLM[LLM API]
-    CRON[Scheduled Job] --> HF[Hugging Face]
-    HF --> DB
+    USER["Browser"] --> FE["React Frontend\n(Vercel)"]
+    FE -->|"POST /api/recommend\nGET /api/cities"| BE["FastAPI Backend\n(Render)"]
+    BE --> CACHE["Parquet Cache\ndata/cache/"]
+    CACHE -.->|"Built at deploy time\nvia data.loader"| HF["Hugging Face\nDataset"]
+    BE -->|"Filtered candidates + prompt"| LLM["Groq API\n(LLaMA-3)"]
+    LLM -->|"Ranked JSON"| BE
 ```
+
+- **Frontend (Vercel):** React + Vite SPA. Reads `VITE_API_URL` at build time to connect to the Render backend.
+- **Backend (Render):** FastAPI + Uvicorn. The Parquet cache is built during the Render build step (`data.loader --refresh`) and loaded into memory on startup.
+- **LLM (Groq):** `GROQ_API_KEY` is injected as a Render environment variable. No LLM responses are cached or persisted.
 
 ---
 

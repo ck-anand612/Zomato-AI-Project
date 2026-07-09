@@ -14,3 +14,4 @@ build/
 frontend/node_modules/
 node_modules/
 *.log
+docs/stitch_zomato_ai_recommender/
